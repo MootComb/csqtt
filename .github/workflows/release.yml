@@ -10,9 +10,6 @@ permissions:
   contents: write
 
 jobs:
-  # ─────────────────────────────────────────────────────────────
-  # 0. Resolve tag
-  # ─────────────────────────────────────────────────────────────
   resolve-tag:
     name: Resolve Tag
     runs-on: ubuntu-latest
@@ -38,9 +35,6 @@ jobs:
           echo "Resolved tag: $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-  # ─────────────────────────────────────────────────────────────
-  # 1. Build universal APK
-  # ─────────────────────────────────────────────────────────────
   build-apk:
     name: Build Universal APK
     needs: [resolve-tag]
@@ -83,15 +77,33 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
-      - name: Accept licenses
+      - name: Setup Android SDK env & install NDK
+        shell: bash
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> $GITHUB_ENV
 
-      - name: Install NDK
-        run: |
-          yes | sdkmanager --install "ndk;26.1.10909125" > /dev/null
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
-          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
+          SDKMGR=$(find "$SDK_ROOT/cmdline-tools" -maxdepth 3 -type f -name sdkmanager 2>/dev/null | head -n1)
+          if [ -z "$SDKMGR" ]; then
+            echo "sdkmanager not found, installing cmdline-tools..."
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+            cd "$SDK_ROOT/cmdline-tools"
+            curl -sSLo cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q cmdline-tools.zip
+            rm cmdline-tools.zip
+            mv cmdline-tools latest 2>/dev/null || true
+            SDKMGR="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          echo "Using sdkmanager: $SDKMGR"
+          echo "SDKMGR=$SDKMGR" >> $GITHUB_ENV
+          echo "$(dirname "$SDKMGR")" >> $GITHUB_PATH
+
+          yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+          yes | "$SDKMGR" --install "ndk;26.1.10909125" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/26.1.10909125" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$SDK_ROOT/ndk/26.1.10909125" >> $GITHUB_ENV
 
       - name: Build native Rust .so for all Android ABIs
         working-directory: rust-client
@@ -125,9 +137,6 @@ jobs:
           name: csqtt-apk
           path: dist/csqtt-universal.apk
 
-  # ─────────────────────────────────────────────────────────────
-  # 2. Build Rust server binary "csqtt"
-  # ─────────────────────────────────────────────────────────────
   build-server:
     name: Build Server (${{ matrix.suffix }})
     needs: [resolve-tag]
@@ -150,7 +159,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Add target explicitly (respect rust-toolchain.toml)
+      - name: Add target explicitly
         working-directory: rust-server
         run: rustup target add ${{ matrix.target }}
 
@@ -176,8 +185,7 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.target }}
           mkdir -p ../dist
-          cp target/${{ matrix.target }}/release/csqtt \
-             ../dist/csqtt-${{ matrix.suffix }}
+          cp target/${{ matrix.target }}/release/csqtt ../dist/csqtt-${{ matrix.suffix }}
           strip ../dist/csqtt-${{ matrix.suffix }} || true
 
       - name: Upload server binary
@@ -186,9 +194,6 @@ jobs:
           name: csqtt-server-${{ matrix.suffix }}
           path: dist/csqtt-${{ matrix.suffix }}
 
-  # ─────────────────────────────────────────────────────────────
-  # 3. Publish to GitHub Release
-  # ─────────────────────────────────────────────────────────────
   release:
     name: Publish Release
     needs: [resolve-tag, build-apk, build-server]
