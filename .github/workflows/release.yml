@@ -1,0 +1,219 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # 0. Resolve tag
+  # ─────────────────────────────────────────────────────────────
+  resolve-tag:
+    name: Resolve Tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Checkout (for SHA)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve tag
+        id: resolve
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            SHORT_SHA=$(git rev-parse --short=7 HEAD)
+            DATE=$(date -u +'%Y.%m.%d')
+            TAG="v${DATE}-${SHORT_SHA}"
+          fi
+          echo "Resolved tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  # ─────────────────────────────────────────────────────────────
+  # 1. Build universal APK
+  # ─────────────────────────────────────────────────────────────
+  build-apk:
+    name: Build Universal APK
+    needs: [resolve-tag]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Rust (for native client .so)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-client/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-client/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Add Android NDK
+        run: |
+          yes | sdkmanager --install "ndk;26.1.10909125" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
+
+      - name: Build native Rust .so for all Android ABIs
+        working-directory: rust-client
+        run: |
+          cargo ndk \
+            -t arm64-v8a -t armeabi-v7a -t x86_64 -t x86 \
+            -o ../app/src/main/jniLibs \
+            build --release
+
+      - name: Build Universal APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleUniversalRelease \
+            --no-daemon --stacktrace
+
+      - name: Locate & rename APK
+        id: apk
+        run: |
+          APK=$(find app/build/outputs/apk -name "*universal*release*.apk" | head -n1)
+          if [ -z "$APK" ]; then
+            APK=$(find app/build/outputs/apk -name "*release*.apk" | head -n1)
+          fi
+          echo "Found APK: $APK"
+          mkdir -p dist
+          cp "$APK" dist/csqtt-universal.apk
+          echo "apk_path=dist/csqtt-universal.apk" >> $GITHUB_OUTPUT
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: csqtt-apk
+          path: dist/csqtt-universal.apk
+
+  # ─────────────────────────────────────────────────────────────
+  # 2. Build Rust server binary "csqtt"
+  # ─────────────────────────────────────────────────────────────
+  build-server:
+    name: Build Server (${{ matrix.suffix }})
+    needs: [resolve-tag]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            suffix: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            suffix: linux-aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compile toolchain (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-server/target
+          key: cargo-server-${{ matrix.target }}-${{ hashFiles('rust-server/Cargo.lock') }}
+          restore-keys: cargo-server-${{ matrix.target }}-
+
+      - name: Build csqtt binary
+        working-directory: rust-server
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          mkdir -p ../dist
+          cp target/${{ matrix.target }}/release/csqtt \
+             ../dist/csqtt-${{ matrix.suffix }}
+          strip ../dist/csqtt-${{ matrix.suffix }} || true
+
+      - name: Upload server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: csqtt-server-${{ matrix.suffix }}
+          path: dist/csqtt-${{ matrix.suffix }}
+
+  # ─────────────────────────────────────────────────────────────
+  # 3. Publish to GitHub Release
+  # ─────────────────────────────────────────────────────────────
+  release:
+    name: Publish Release
+    needs: [resolve-tag, build-apk, build-server]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: csqtt-apk
+          path: dist
+
+      - name: Download server binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: csqtt-server-*
+          path: dist
+          merge-multiple: true
+
+      - name: List files
+        run: ls -la dist
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve-tag.outputs.tag }}
+          name: CSQTT ${{ needs.resolve-tag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/csqtt-universal.apk
+            dist/csqtt-linux-x86_64
+            dist/csqtt-linux-aarch64
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
