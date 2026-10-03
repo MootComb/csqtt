@@ -56,9 +56,6 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Setup Rust (for native client .so)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -86,10 +83,15 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
-      - name: Add Android NDK
+      - name: Accept licenses
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+
+      - name: Install NDK
         run: |
           yes | sdkmanager --install "ndk;26.1.10909125" > /dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
 
       - name: Build native Rust .so for all Android ABIs
         working-directory: rust-client
@@ -147,6 +149,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Add target explicitly (respect rust-toolchain.toml)
+        working-directory: rust-server
+        run: rustup target add ${{ matrix.target }}
 
       - name: Install cross-compile toolchain (aarch64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
